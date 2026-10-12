@@ -502,13 +502,12 @@ class MambaComponent(TreeComponent):
         if cd.lock_ref == 0:
             self.tree_core._update_evictable_leaf_sets(node)
 
-    def _alloc_mamba_slot(self) -> torch.Tensor:
+    def _alloc_mamba_slot(self) -> Optional[torch.Tensor]:
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
         return slot
 
     @property
@@ -610,6 +609,8 @@ class MambaComponent(TreeComponent):
             if self.int8_ckpt_pool is not None:
                 if self.cache.enable_mamba_extra_buffer:
                     new_slot = self._alloc_mamba_slot()
+                    if new_slot is None:
+                        return 0
                     src_active = (
                         self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                             req, new_slot
@@ -623,6 +624,8 @@ class MambaComponent(TreeComponent):
                     )
             elif self.cache.enable_mamba_extra_buffer:
                 new_slot = self._alloc_mamba_slot()
+                if new_slot is None:
+                    return 0
                 mamba_value_donated = (
                     self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                         req, new_slot
@@ -630,6 +633,8 @@ class MambaComponent(TreeComponent):
                 )
             else:
                 mamba_value_donated = self._alloc_mamba_slot()
+                if mamba_value_donated is None:
+                    return 0
                 # mamba_pool is a pure PHYSICAL store; translate both slot ids
                 # virtual->physical (identity for the non-unified memory pool) first.
                 translate = self.cache.req_to_token_pool.translate_mamba_indices
@@ -678,9 +683,10 @@ class MambaComponent(TreeComponent):
             if not mamba_value_inserted:
                 pool.free_mamba_cache(req)
         else:
-            if insert_params.mamba_value is not None and (
-                insert_result is None or insert_result.mamba_exist
-            ):
+            if insert_params.mamba_value is None:
+                # The request still owns its checkpoint and can retry donation later.
+                return
+            if insert_result is None or insert_result.mamba_exist:
                 self._free_mamba_value(insert_params.mamba_value)
             req.kv.mamba_last_track_seqlen = None
             req.kv.mamba_prev_track_seqlen = None
