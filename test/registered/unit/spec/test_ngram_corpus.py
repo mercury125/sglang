@@ -115,17 +115,17 @@ EXPECTED_BFS_MASKS = [
         [1, 1, 1, 1, 1, 0, 0, 0],
         [1, 1, 1, 1, 1, 1, 0, 0],
         [1, 1, 1, 1, 1, 1, 1, 0],
-        [1, 0, 0, 0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 0, 0, 0, 1],
     ],
     [
         [1, 0, 0, 0, 0, 0, 0, 0],
-        [1, 1, 0, 0, 0, 0, 0, 0],
-        [1, 0, 1, 0, 0, 0, 0, 0],
-        [1, 0, 0, 1, 0, 0, 0, 0],
-        [1, 0, 0, 0, 1, 0, 0, 0],
-        [1, 0, 0, 0, 0, 1, 0, 0],
-        [1, 0, 0, 0, 0, 0, 1, 0],
-        [1, 0, 0, 0, 0, 0, 0, 1],
+        [0, 1, 0, 0, 0, 0, 0, 0],
+        [0, 0, 1, 0, 0, 0, 0, 0],
+        [0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0, 0, 0],
+        [0, 0, 0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1],
     ],
 ]
 
@@ -148,17 +148,17 @@ EXPECTED_PROB_MASKS = [
         [1, 1, 1, 1, 1, 0, 0, 0],
         [1, 1, 1, 1, 1, 1, 0, 0],
         [1, 1, 1, 1, 1, 1, 1, 0],
-        [1, 0, 0, 0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 0, 0, 0, 1],
     ],
     [
         [1, 0, 0, 0, 0, 0, 0, 0],
-        [1, 1, 0, 0, 0, 0, 0, 0],
-        [1, 0, 1, 0, 0, 0, 0, 0],
-        [1, 0, 0, 1, 0, 0, 0, 0],
-        [1, 0, 0, 0, 1, 0, 0, 0],
-        [1, 0, 0, 0, 0, 1, 0, 0],
-        [1, 0, 0, 0, 0, 0, 1, 0],
-        [1, 0, 0, 0, 0, 0, 0, 1],
+        [0, 1, 0, 0, 0, 0, 0, 0],
+        [0, 0, 1, 0, 0, 0, 0, 0],
+        [0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0, 0, 0],
+        [0, 0, 0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1],
     ],
 ]
 
@@ -217,6 +217,7 @@ class TestNgramCorpusNoMatch(CustomTestCase):
             all(t == 0 for t in ids_list[1:]),
             "No draft tokens expected when nothing matches",
         )
+        np.testing.assert_array_equal(masks.reshape(8, 8), np.eye(8))
 
     def test_empty_corpus(self):
         corpus = _make_corpus("BFS")
@@ -224,6 +225,48 @@ class TestNgramCorpusNoMatch(CustomTestCase):
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 3)
         self.assertTrue(all(t == 0 for t in ids_list[1:]))
+        np.testing.assert_array_equal(masks.reshape(8, 8), np.eye(8))
+
+
+class TestNgramCorpusPadding(CustomTestCase):
+    def test_padding_is_disconnected_from_real_zero_token(self):
+        for match_type in ("BFS", "PROB"):
+            with self.subTest(match_type=match_type):
+                corpus = _make_corpus(match_type, draft_token_num=12)
+                corpus.batch_put([[10, 20, 30, 0, 40]])
+                corpus.synchronize()
+
+                ids, masks = _batch_get(corpus, [[10, 20, 30]])
+                self.assertEqual(ids.tolist(), [30, 0, 40] + [0] * 9)
+                mask = masks.reshape(12, 12)
+                expected = np.eye(12, dtype=np.int64)
+                expected[1, 0] = 1
+                expected[2, :2] = 1
+                np.testing.assert_array_equal(mask, expected)
+                self.assertEqual(
+                    corpus.leaf_paths_from_mask(ids.tolist(), mask.tolist()),
+                    [[30, 0, 40]],
+                )
+
+    def test_real_zero_leaf_survives_external_corpus_merge(self):
+        for match_type in ("BFS", "PROB"):
+            for online_token, external_token in ((0, 40), (40, 0)):
+                with self.subTest(match_type=match_type, online_token=online_token):
+                    corpus = _make_corpus(
+                        match_type,
+                        draft_token_num=12,
+                        external_sam_budget=3,
+                        external_corpus_documents=[[10, 20, 30, external_token]],
+                    )
+                    corpus.batch_put([[10, 20, 30, online_token]])
+                    corpus.synchronize()
+
+                    ids, masks = _batch_get(corpus, [[10, 20, 30]])
+                    mask = masks.reshape(12, 12)
+                    connected = np.flatnonzero(mask[1:, 0]) + 1
+                    self.assertEqual(sorted(ids[connected].tolist()), [0, 40])
+                    self.assertEqual(mask[:, 0].sum(), 3)
+                    np.testing.assert_array_equal(mask[3:], np.eye(12)[3:])
 
 
 class TestNgramCorpusMultipleInserts(CustomTestCase):

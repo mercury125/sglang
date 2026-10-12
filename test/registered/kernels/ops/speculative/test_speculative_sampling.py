@@ -4,14 +4,19 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.test.ci.ci_register import register_cuda_ci
 
 if torch.version.cuda is not None:
     from sglang.kernels.ops.speculative.sampling import (
         tree_speculative_sampling_target_only,
     )
+    from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
 else:
-    from sgl_kernel import tree_speculative_sampling_target_only
+    from sgl_kernel import (
+        reconstruct_indices_from_tree_mask,
+        tree_speculative_sampling_target_only,
+    )
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -215,6 +220,78 @@ def test_target_only_sampling_cdf_boundaries(
 
     assert predicts[0].item() == expected_token
     assert accept_token_num.item() == expected_accept_token_num
+
+
+@pytest.mark.parametrize("continuation", [None, 1, 0])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_ngram_padding_preserves_target_distribution(continuation, use_cuda_graph):
+    num_draft_tokens = 12
+    corpus = NgramCorpus(draft_token_num=num_draft_tokens)
+    if continuation is not None:
+        corpus.batch_put([[3, continuation]])
+        corpus.synchronize()
+    tokens, mask = corpus.batch_get(["padding"], [[3]], [1])
+
+    # Independent midpoint grids cover both coins without a statistical tolerance.
+    grid = (torch.arange(100, device="cuda", dtype=torch.float32) + 0.5) / 100
+    batch_size = grid.numel() ** 2
+    candidates = torch.tensor(tokens, device="cuda").repeat(batch_size, 1)
+    tree_mask = torch.tensor(mask, device="cuda", dtype=torch.bool).repeat(batch_size)
+    seq_lens = torch.full((batch_size,), 2, device="cuda", dtype=torch.int64)
+    positions = torch.empty(
+        batch_size * num_draft_tokens, device="cuda", dtype=torch.int64
+    )
+    retrieve_index = torch.empty_like(candidates)
+    retrieve_next_token = torch.empty_like(candidates)
+    retrieve_next_sibling = torch.empty_like(candidates)
+    probabilities = torch.tensor([0.05, 0.75, 0.2, 0.0], device="cuda")
+    target_probs = probabilities.repeat(batch_size, num_draft_tokens, 1)
+    draft_probs = torch.empty_like(target_probs)
+    predicts = torch.empty(
+        batch_size * num_draft_tokens, device="cuda", dtype=torch.int32
+    )
+    accept_index = torch.empty((batch_size, 2), device="cuda", dtype=torch.int32)
+    accept_token_num = torch.empty(batch_size, device="cuda", dtype=torch.int32)
+    coins = torch.zeros_like(candidates, dtype=torch.float32)
+    coins[:, 0] = grid.repeat_interleave(grid.numel())
+    final_coins = grid.repeat(grid.numel())
+
+    def sample():
+        draft_probs.zero_()
+        reconstruct_indices_from_tree_mask(
+            tree_mask,
+            seq_lens,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            batch_size,
+            num_draft_tokens,
+        )
+        tree_speculative_sampling_target_only(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=final_coins,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            deterministic=True,
+        )
+
+    sample()
+    if use_cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            sample()
+        graph.replay()
+    sampled = predicts.view(batch_size, num_draft_tokens)[:, 0].long()
+    observed = torch.bincount(sampled, minlength=4) / batch_size
+    torch.testing.assert_close(observed, probabilities, rtol=0, atol=0.001)
 
 
 if __name__ == "__main__":
